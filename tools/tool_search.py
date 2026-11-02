@@ -52,6 +52,10 @@ class ToolSearchConfig:
     listing_max_tokens: int = 4000  # budget = min(this, threshold_pct% of context)
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
+    # Toolset names whose tools are NEVER deferred behind tool_search (always in the visible
+    # tool list), e.g. ["homeassistant"] for a voice profile where an extra search round-trip
+    # per request is too slow. Empty = no override. Wins over ``defer`` and the plugin default.
+    always_visible_toolsets: frozenset = frozenset()
 
     @property
     def effective_defer_tools(self) -> frozenset:
@@ -65,6 +69,7 @@ class ToolSearchConfig:
             raw = {"enabled": "off" if raw is False else "auto"}
         max_search_limit = _clamped_int(raw.get("max_search_limit"), 25, 1, 50)
         defer_raw = raw.get("defer")
+        visible_raw = raw.get("always_visible_toolsets")
         if defer_raw is not None and not isinstance(defer_raw, (list, tuple, set)):
             # Loud, then the curated default: a scalar here means the user tried to shrink the
             # tool surface and got nothing — never silently ignore it (#116404).
@@ -82,7 +87,10 @@ class ToolSearchConfig:
             listing=_tri_state(raw.get("listing", "auto")),
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
-                         if isinstance(defer_raw, (list, tuple, set)) else None))
+                         if isinstance(defer_raw, (list, tuple, set)) else None),
+            always_visible_toolsets=(
+                frozenset(str(n).strip() for n in visible_raw if str(n).strip())
+                if isinstance(visible_raw, (list, tuple, set)) else frozenset()))
 
 
 _TRI_STATE_ALIASES = {"true": "on", "1": "on", "yes": "on", "false": "off", "0": "off", "no": "off"}
@@ -147,11 +155,22 @@ _DIRECT_SURFACE_TOOLSETS = CLIENT_SURFACE_TOOLSETS | TOOLSET_SESSION_PLATFORMS.k
 _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
 
 
-def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
+def _always_visible_toolsets() -> frozenset:
+    """``tools.tool_search.always_visible_toolsets`` from the read-only user config."""
+    return load_config_readonly().always_visible_toolsets
+
+
+def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None,
+                            visible_toolsets: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
-    plugin tool). Bridge names never defer."""
+    plugin tool). Bridge names never defer, and neither do tools whose toolset is listed in
+    ``always_visible_toolsets`` (resolved from config when ``visible_toolsets`` is None)."""
     if name in BRIDGE_TOOL_NAMES:
+        return False
+    if visible_toolsets is None:
+        visible_toolsets = _always_visible_toolsets()
+    if visible_toolsets and _registry_toolset(name) in visible_toolsets:
         return False
     if defer_tools is not None and name in defer_tools:
         return True
@@ -175,20 +194,25 @@ def session_tool_names(tool_defs: Iterable[dict[str, Any]]) -> frozenset[str]:
 
 
 def classify_tools(tool_defs: list[dict[str, Any]], defer_tools: Optional[frozenset] = None,
+                   visible_toolsets: Optional[frozenset] = None,
                    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable); bridge tools are dropped (re-added
     after classification)."""
     visible: list[dict[str, Any]] = []
     deferrable: list[dict[str, Any]] = []
+    if visible_toolsets is None:
+        visible_toolsets = _always_visible_toolsets()
     for td, name in zip(tool_defs, _tool_def_names(tool_defs)):
         if name not in BRIDGE_TOOL_NAMES:
-            (deferrable if is_deferrable_tool_name(name, defer_tools) else visible).append(td)
+            (deferrable if is_deferrable_tool_name(name, defer_tools, visible_toolsets)
+             else visible).append(td)
     return visible, deferrable
 
 
 def _deferrable_in(tool_defs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Deferrable subset of pre-assembly ``tool_defs`` under the read-only user config."""
-    return classify_tools(tool_defs, load_config_readonly().effective_defer_tools)[1]
+    cfg = load_config_readonly()
+    return classify_tools(tool_defs, cfg.effective_defer_tools, cfg.always_visible_toolsets)[1]
 
 
 def estimate_tokens_from_schemas(tool_defs: Iterable[dict[str, Any]]) -> int:
@@ -348,7 +372,8 @@ def assemble_tool_defs(tool_defs: list[dict[str, Any]], *, context_length: Optio
     config = config or load_config()
     incoming = [td for td, name in zip(tool_defs, _tool_def_names(tool_defs))
                 if name not in BRIDGE_TOOL_NAMES]
-    visible, deferrable = classify_tools(incoming, config.effective_defer_tools)
+    visible, deferrable = classify_tools(
+        incoming, config.effective_defer_tools, config.always_visible_toolsets)
     connections_granted = connections_in_scope(incoming)
     if not deferrable:
         if should_activate(config, 0, context_length, connections_granted=connections_granted):
@@ -546,9 +571,10 @@ def scoped_deferrable_names(tool_defs: list[dict[str, Any]]) -> frozenset[str]:
     """Deferrable names in the *pre-assembly* ``tool_defs`` of the session scope — the
     universe ``tool_call`` may reach. Gates bridge dispatch AND the executor unwrap so a
     restricted session cannot invoke an out-of-scope tool via the bridge."""
-    defer_tools = load_config_readonly().effective_defer_tools
+    cfg = load_config_readonly()
+    defer_tools = cfg.effective_defer_tools
     return frozenset(n for n in _tool_def_names(tool_defs)
-                     if n and is_deferrable_tool_name(n, defer_tools))
+                     if n and is_deferrable_tool_name(n, defer_tools, cfg.always_visible_toolsets))
 
 
 def out_of_scope_reason(name: str) -> Optional[str]:
